@@ -11,12 +11,34 @@ A tiny macOS menu bar utility that makes external mice feel right. Single-file S
 - 模拟触摸板的动量滚动：速度指数衰减、亚像素累积、反向立即响应
 
 ### ⌨️ Windows 风格 Ctrl 快捷键
-- `Ctrl+C` / `Ctrl+V` / `Ctrl+X` / `Ctrl+A` → 自动改写为 `Cmd+C/V/X/A`（复制 / 粘贴 / 剪切 / 全选）
-- `Ctrl+Q` → 改写为 `Ctrl+A`，保留 macOS 原生的「移到行首」
+
+| 按键 | 改写为 | 作用 |
+|------|--------|------|
+| `Ctrl+C` / `Ctrl+V` / `Ctrl+X` / `Ctrl+A` | `Cmd+C/V/X/A` | 复制 / 粘贴 / 剪切 / 全选 |
+| `Ctrl+S` | `Cmd+S` | 保存 |
+| `Ctrl+Z` | `Cmd+Z` | 撤销 |
+| `Ctrl+Y` | `Cmd+Shift+Z` | 重做（macOS 标准，兼容性优于 `Cmd+Y`） |
+| `Ctrl+Q` | `Ctrl+A` | 保留 macOS 原生的「移到行首」 |
+
 - 其他修饰键原样保留（`Ctrl+Shift+V` 同样生效）
-- **终端类 app 自动跳过**（Terminal、iTerm2、Warp、kitty、WezTerm、Alacritty、Hyper、Ghostty）——终端里 `Ctrl+C` 是 SIGINT，不能动
+- **终端类 app 自动跳过**（Terminal、iTerm2、Warp、kitty、WezTerm、Alacritty、Hyper、Ghostty）——终端里 `Ctrl+C` 是 SIGINT、`Ctrl+Z` 是 SIGTSTP、`Ctrl+S` 是流控冻结，不能动
 
 两个功能都可在菜单栏独立开关。
+
+## 系统要求
+
+- macOS 12 (Monterey) 及以上
+- Apple Silicon（arm64）。Intel 机器需自行修改 `build.sh` 中的 `-target` 后重新编译
+
+## 使用
+
+1. 从 [Releases](../../releases) 下载 `MouseFix.app.zip`，解压后拖入「应用程序」文件夹（或任意位置）
+2. 首次打开：右键 `MouseFix.app` → 打开（ad-hoc 签名，需绕过 Gatekeeper 提示）
+3. 按提示授予**辅助功能**权限：系统设置 → 隐私与安全性 → 辅助功能 → 勾选 MouseFix
+4. 授权后自动生效，无需重启 app；菜单栏出现 `MouseFix`，点击可独立开关两项功能
+5. 退出：菜单栏 → 退出
+
+日志位于 `~/Library/Logs/MouseFix.log`，排查问题时可查看。
 
 ## 构建
 
@@ -42,4 +64,4 @@ open MouseFix.app
 
 ## License
 
-MIT
+MIT — 见 [LICENSE](LICENSE)。
