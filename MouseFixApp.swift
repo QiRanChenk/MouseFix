@@ -81,7 +81,16 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     // MARK: - 菜单栏
     private func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        statusItem.button?.title = "MouseFix"
+        // 菜单栏图标：macOS 风格 template 图标，自动跟随明暗菜单栏反色
+        if let img = NSImage(systemSymbolName: "computermouse", accessibilityDescription: "MouseFix") {
+            let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
+            let sized = img.withSymbolConfiguration(cfg) ?? img
+            sized.isTemplate = true
+            statusItem.button?.image = sized
+            statusItem.button?.imagePosition = .imageOnly
+        } else {
+            statusItem.button?.title = "MouseFix"
+        }
         let m = NSMenu()
         m.autoenablesItems = false
         m.addItem(makeItem(#selector(toggleScroll), "反向鼠标滚轮"))
