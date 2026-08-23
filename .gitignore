@@ -1,0 +1,9 @@
+# 构建产物
+MouseFix
+MouseFix.app/
+
+# macOS
+.DS_Store
+
+# 本地配置
+.claude/
