@@ -15,19 +15,19 @@ func drawMouse(pixels: Int) -> NSBitmapImageRep {
     NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
     let ctx = NSGraphicsContext.current!.cgContext
 
-    // 鼠标身体：竖向圆角矩形，紧贴画布（上下各留 1px 呼吸位）
-    let body = NSRect(x: s * 0.24, y: s * 0.03, width: s * 0.52, height: s * 0.94)
-    let bodyPath = NSBezierPath(roundedRect: body, xRadius: s * 0.26, yRadius: s * 0.26)
+    // 鼠标身体：竖向圆角矩形，比例短胖一些（占画布 80% 高，上下留白）
+    let body = NSRect(x: s * 0.26, y: s * 0.10, width: s * 0.48, height: s * 0.80)
+    let bodyPath = NSBezierPath(roundedRect: body, xRadius: s * 0.24, yRadius: s * 0.24)
     NSColor.black.setFill()
     bodyPath.fill()
 
     // 滚轮：透明镂空
     ctx.setBlendMode(.clear)
-    let wheel = NSBezierPath(roundedRect: NSRect(x: s * 0.44, y: s * 0.56, width: s * 0.12, height: s * 0.24),
-                             xRadius: s * 0.06, yRadius: s * 0.06)
+    let wheel = NSBezierPath(roundedRect: NSRect(x: s * 0.45, y: s * 0.52, width: s * 0.10, height: s * 0.20),
+                             xRadius: s * 0.05, yRadius: s * 0.05)
     wheel.fill()
     // 按键分割线：透明镂空
-    let split = NSBezierPath(roundedRect: NSRect(x: body.minX, y: s * 0.50, width: body.width, height: s * 0.05),
+    let split = NSBezierPath(roundedRect: NSRect(x: body.minX, y: s * 0.46, width: body.width, height: s * 0.05),
                              xRadius: s * 0.025, yRadius: s * 0.025)
     split.fill()
     ctx.setBlendMode(.normal)
