@@ -8,3 +8,5 @@ MouseFix.app/
 # 本地配置
 .claude/
 MouseFix.app.zip
+.codesign/
+.dsh-vision-router/

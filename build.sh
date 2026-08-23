@@ -29,8 +29,23 @@ cp "$APP_NAME" "$MACOS_DIR/$APP_NAME"
 cp Info.plist "$CONTENTS/Info.plist"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
-echo "==> ad-hoc 签名（关闭沙箱 + 辅助功能需要）"
-codesign --force --sign - --entitlements MouseFix.entitlements "$APP_DIR"
+echo "==> 签名（固定自签名证书，保证 TCC 授权跨构建有效）"
+KC="$PWD/.codesign/mousefix.keychain-db"
+SIGN="-"
+if [ ! -f "$KC" ]; then
+  ./make-identity.sh || true
+fi
+if [ -f "$KC" ]; then
+  SIGN="MouseFix Dev"
+  # 确保签名钥匙串在搜索列表中（codesign 只查搜索列表）
+  if ! security list-keychains -d user | tr -d ' "' | grep -qx "$KC"; then
+    # shellcheck disable=SC2046
+    security list-keychains -d user -s $(security list-keychains -d user | tr -d ' "') "$KC"
+  fi
+  # shellcheck disable=SC2046
+  security unlock-keychain -p "$(cat .codesign/keychain-password)" "$KC" || true
+fi
+codesign --force --sign "$SIGN" --entitlements MouseFix.entitlements "$APP_DIR"
 
 echo "==> 验证"
 codesign --verify --verbose=2 "$APP_DIR" 2>&1 | head -5
