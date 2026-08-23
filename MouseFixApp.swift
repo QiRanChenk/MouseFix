@@ -16,10 +16,22 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ n: Notification) {
         setupLog()
         setupMenu()
-        if !AXIsProcessTrusted() {
+        if AXIsProcessTrusted() {
+            installEventTap()
+        } else {
             showAccessibilityAlert()
+            waitForTrustThenInstall()
         }
-        installEventTap()
+    }
+
+    // 授权可能在启动后才给：轮询直到 trusted，再装 tap，免去手动重启
+    private func waitForTrustThenInstall() {
+        Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] t in
+            guard let self, AXIsProcessTrusted() else { return }
+            t.invalidate()
+            self.log("accessibility granted, installing tap")
+            self.installEventTap()
+        }
     }
 
     // MARK: - 日志
@@ -145,7 +157,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - 键盘：Windows 风格 Ctrl 快捷键
-    // Ctrl+C/V/X/A → Cmd+C/V/X/A；Ctrl+Q → Ctrl+A（保留系统的"移到行首"）。
+    // Ctrl+C/V/X/A/S/Z → Cmd 同键；Ctrl+Y → Cmd+Shift+Z（重做）；Ctrl+Q → Ctrl+A（保留系统的"移到行首"）。
     // 终端里 Ctrl+C 是 SIGINT，Ctrl+A/Q 也各有含义，故终端类 app 全部跳过。
     private let excludedBundleIDs: Set<String> = [
         "com.apple.Terminal",
@@ -165,6 +177,9 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         static let c: Int64 = 0x08
         static let v: Int64 = 0x09
         static let q: Int64 = 0x0C
+        static let s: Int64 = 0x01
+        static let z: Int64 = 0x06
+        static let y: Int64 = 0x10
     }
 
     private func processKey(_ event: CGEvent) -> Unmanaged<CGEvent>? {
@@ -183,12 +198,22 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
 
         let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
         switch keyCode {
-        case Key.c, Key.v, Key.x, Key.a:
+        case Key.c, Key.v, Key.x, Key.a, Key.s, Key.z:
             // Ctrl 换成 Cmd，其余修饰键（如 Shift）原样保留
             var f = flags
             f.remove(.maskControl)
             f.insert(.maskCommand)
             event.flags = f
+            if event.type == .keyDown { log("remap Ctrl+\(keyCode) -> Cmd") }
+        case Key.y:
+            // Ctrl+Y → Cmd+Shift+Z：macOS 标准重做
+            var f = flags
+            f.remove(.maskControl)
+            f.insert(.maskCommand)
+            f.insert(.maskShift)
+            event.flags = f
+            event.setIntegerValueField(.keyboardEventKeycode, value: Key.z)
+            if event.type == .keyDown { log("remap Ctrl+Y -> Cmd+Shift+Z") }
         case Key.q:
             // Ctrl+Q → Ctrl+A：交给系统原生的"行首"行为
             event.setIntegerValueField(.keyboardEventKeycode, value: Key.a)
