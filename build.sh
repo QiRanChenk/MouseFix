@@ -28,6 +28,7 @@ mkdir -p "$MACOS_DIR" "$RES_DIR"
 cp "$APP_NAME" "$MACOS_DIR/$APP_NAME"
 cp Info.plist "$CONTENTS/Info.plist"
 [ -f assets/AppIcon.icns ] && cp assets/AppIcon.icns "$RES_DIR/AppIcon.icns"
+[ -f assets/menubar-icon.png ] && cp assets/menubar-icon.png assets/menubar-icon@2x.png "$RES_DIR/"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
 echo "==> 签名（固定自签名证书，保证 TCC 授权跨构建有效）"

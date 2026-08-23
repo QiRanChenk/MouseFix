@@ -81,12 +81,10 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     // MARK: - 菜单栏
     private func setupMenu() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        // 菜单栏图标：macOS 风格 template 图标，自动跟随明暗菜单栏反色
-        if let img = NSImage(systemSymbolName: "computermouse", accessibilityDescription: "MouseFix") {
-            let cfg = NSImage.SymbolConfiguration(pointSize: 15, weight: .regular)
-            let sized = img.withSymbolConfiguration(cfg) ?? img
-            sized.isTemplate = true
-            statusItem.button?.image = sized
+        // 菜单栏图标：自绘鼠标剪影模板图（紧贴画布不裁切），自动跟随明暗菜单栏反色
+        if let img = NSImage(named: "menubar-icon") {
+            img.isTemplate = true
+            statusItem.button?.image = img
             statusItem.button?.imagePosition = .imageOnly
         } else {
             statusItem.button?.title = "MouseFix"
