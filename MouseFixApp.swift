@@ -471,16 +471,47 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                 timer.cancel()
                 self.middleProbeTimer = nil
                 self.log("middle click -> copy")
-            } else if tries >= 9 {   // ≈250ms 剪贴板无变化 = 无选中 → 粘贴
+            } else if tries >= 9 {   // ≈250ms 剪贴板无变化 = 无选中
                 timer.cancel()
                 self.middleProbeTimer = nil
-                self.postCmdKey(Key.v)
-                self.log("middle click -> paste")
+                switch self.focusedEditableState() {
+                case false:   // AX 明确表明聚焦的不是可编辑文本 → 不粘贴
+                    self.log("middle click -> paste skipped (no focused text input)")
+                default:      // 输入框激活，或 AX 无法判断（保底粘贴，兼容终端等 AX 薄弱应用）
+                    self.postCmdKey(Key.v)
+                    self.log("middle click -> paste")
+                }
             }
             tries += 1
         }
         timer.resume()
         middleProbeTimer = timer
+    }
+
+    /// AX 判断当前聚焦元素是否可编辑文本（输入框激活）。
+    /// true = 文本框/文本域等；false = 有角色但明确不是可编辑文本；nil = 无法判断（无聚焦元素/AX 不可用）。
+    private func focusedEditableState() -> Bool? {
+        let systemWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(systemWide, 0.1)   // 主线程调用，限时防卡
+        var value: AnyObject?
+        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &value) == .success,
+              let element = value else { return nil }
+        let axEl = element as! AXUIElement
+        AXUIElementSetMessagingTimeout(axEl, 0.1)
+
+        // 常见可编辑文本角色
+        var roleObj: AnyObject?
+        let role = (AXUIElementCopyAttributeValue(axEl, kAXRoleAttribute as CFString, &roleObj) == .success)
+            ? (roleObj as? String) ?? "" : ""
+        if ["AXTextField", "AXTextArea", "AXComboBox"].contains(role) { return true }
+
+        // 自绘编辑器/终端等：支持读写选区即视为可编辑
+        var rangeObj: AnyObject?
+        if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString, &rangeObj) == .success,
+           rangeObj != nil { return true }
+
+        // 有角色但既不是文本角色也不支持选区 → 明确不是输入框
+        return role.isEmpty ? nil : false
     }
 
     /// 合成 Cmd+键（打 synthetic 标记；事件会再次经过自己的 tap，processKey 只放行 Cmd 组合不会拦截）
@@ -519,6 +550,12 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         let field = NSTextField(frame: NSRect(x: 20, y: 40, width: 380, height: 24))
         field.stringValue = "hello middle click"
         win.contentView?.addSubview(field)
+        // 可聚焦的非文本视图（模拟无输入框激活的场景）
+        final class FocusAnchor: NSView {
+            override var acceptsFirstResponder: Bool { true }
+        }
+        let anchor = FocusAnchor(frame: NSRect(x: 20, y: 8, width: 120, height: 14))
+        win.contentView?.addSubview(anchor)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         win.makeFirstResponder(field)
@@ -560,9 +597,18 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     let pasteOK = field.stringValue.contains("PASTE-TOKEN")
                     self.log("selftest paste: \(pasteOK ? "OK" : "FAIL"), field=\(field.stringValue)")
-                    let ok = copyOK && pasteOK
-                    self.log("SELFTEST-MIDDLE \(ok ? "PASS" : "FAIL")")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
+                    // 阶段 3（观察）：非输入框聚焦 → 粘贴应被跳过（AX 可识别时）
+                    win.makeFirstResponder(anchor)
+                    pb.clearContents()
+                    pb.setString("NOPE-TOKEN", forType: .string)
+                    postMiddle()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                        let skipped = !field.stringValue.contains("NOPE-TOKEN")
+                        self.log("selftest skip-path: skipped=\(skipped), editableState=\(String(describing: self.focusedEditableState()))")
+                        let ok = copyOK && pasteOK
+                        self.log("SELFTEST-MIDDLE \(ok ? "PASS" : "FAIL")")
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
+                    }
                 }
             }
         }
