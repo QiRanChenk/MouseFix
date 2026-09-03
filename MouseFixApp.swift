@@ -1,6 +1,5 @@
 import Cocoa
 import ApplicationServices
-import Carbon
 
 // Synthetic event marker (防递归)
 private let kSyntheticMarker: Int64 = 0x4D4F4F53 // 'MOOS'
@@ -18,7 +17,6 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         static let winKeyLauncher       = "winKeyLauncher"
         static let winShowDesktop       = "winShowDesktop"
         static let winThumbnails        = "winThumbnails"
-        static let winSpaceIME          = "winSpaceIME"
         static let middleClickCopyPaste = "middleClickCopyPaste"
     }
 
@@ -53,10 +51,6 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         get { Self.pref(PrefKey.winThumbnails) }
         set { Self.setPref(PrefKey.winThumbnails, newValue) }
     }
-    var winSpaceIME: Bool {
-        get { Self.pref(PrefKey.winSpaceIME) }
-        set { Self.setPref(PrefKey.winSpaceIME, newValue) }
-    }
     var middleClickCopyPaste: Bool {
         get { Self.pref(PrefKey.middleClickCopyPaste) }
         set { Self.setPref(PrefKey.middleClickCopyPaste, newValue) }
@@ -77,7 +71,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         switcher.thumbnailsEnabled = winThumbnails
         log("config: reverseScroll=\(reverseScroll) winKeyRemap=\(winKeyRemap) winSwitcher=\(winSwitcher) "
           + "winKeyLauncher=\(winKeyLauncher) winShowDesktop=\(winShowDesktop) winThumbnails=\(winThumbnails) "
-          + "winSpaceIME=\(winSpaceIME) middleClickCopyPaste=\(middleClickCopyPaste)")
+          + "middleClickCopyPaste=\(middleClickCopyPaste)")
         // 调试预览：--preview-switcher 直接展示切换器面板（不装 tap，无需授权，便于截图验证 UI）
         if CommandLine.arguments.contains("--preview-switcher") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in
@@ -152,7 +146,6 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         m.addItem(makeItem(#selector(toggleLauncher), "Win 键打开应用列表"))
         m.addItem(makeItem(#selector(toggleShowDesktopPref), "Win+D 显示桌面"))
         m.addItem(makeItem(#selector(toggleThumbnails), "窗口缩略图（需屏幕录制）"))
-        m.addItem(makeItem(#selector(toggleSpaceIME), "Win+空格 切换输入法"))
         m.addItem(makeItem(#selector(toggleMiddleClick), "中键复制/粘贴（无选中时粘贴）"))
         m.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
@@ -176,8 +169,8 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         setCheck(m.item(at: 3)!, on: winKeyLauncher)
         setCheck(m.item(at: 4)!, on: winShowDesktop)
         setCheck(m.item(at: 5)!, on: winThumbnails)
-        setCheck(m.item(at: 6)!, on: winSpaceIME)
-        setCheck(m.item(at: 7)!, on: middleClickCopyPaste)
+        setCheck(m.item(at: 5)!, on: winThumbnails)
+        setCheck(m.item(at: 6)!, on: middleClickCopyPaste)
     }
 
     private func setCheck(_ item: NSMenuItem, on: Bool) {
@@ -205,7 +198,6 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         syncMenuTitles()
         switcher.thumbnailsEnabled = winThumbnails
     }
-    @objc private func toggleSpaceIME() { winSpaceIME.toggle(); syncMenuTitles() }
     @objc private func toggleMiddleClick() { middleClickCopyPaste.toggle(); syncMenuTitles() }
     @objc private func quitApp()        { NSApp.terminate(nil) }
 
@@ -325,17 +317,6 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
             }
         }
 
-        // Win+空格（Cmd+Space）→ 切换输入法（默认是 Spotlight，这里吞掉改作输入法切换）
-        if winSpaceIME, event.type == .keyDown,
-           event.getIntegerValueField(.keyboardEventAutorepeat) == 0 {
-            let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-            let mods = event.flags.intersection([.maskCommand, .maskControl, .maskAlternate, .maskShift])
-            if keyCode == 0x31, mods == .maskCommand {   // 0x31 = Space
-                switchInputSource()
-                return nil
-            }
-        }
-
         guard winKeyRemap else { return Unmanaged.passRetained(event) }
 
         let flags = event.flags
@@ -374,36 +355,6 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
             break
         }
         return Unmanaged.passRetained(event)
-    }
-
-    // MARK: - Win+空格 切换输入法（TIS 在已启用输入法间循环，不依赖系统快捷键设置）
-    private func switchInputSource() {
-        let conditions = [kTISPropertyInputSourceIsEnabled: true] as CFDictionary
-        guard let list = TISCreateInputSourceList(conditions, false)?.takeRetainedValue() as? [TISInputSource]
-        else { return }
-        // 只保留键盘输入源（输入法 / 键盘布局）
-        let sources = list.filter { src in
-            guard let p = TISGetInputSourceProperty(src, kTISPropertyInputSourceCategory) else { return false }
-            let cat = Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as? String
-            return cat == (kTISCategoryKeyboardInputSource as String)
-        }
-        guard sources.count > 1 else { return }
-
-        func sourceID(_ s: TISInputSource) -> String {
-            guard let p = TISGetInputSourceProperty(s, kTISPropertyInputSourceID) else { return "" }
-            return Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as? String ?? ""
-        }
-        func sourceName(_ s: TISInputSource) -> String {
-            guard let p = TISGetInputSourceProperty(s, kTISPropertyLocalizedName) else { return "" }
-            return Unmanaged<AnyObject>.fromOpaque(p).takeUnretainedValue() as? String ?? ""
-        }
-
-        let current = TISCopyCurrentKeyboardInputSource().takeRetainedValue()
-        let curID = sourceID(current)
-        let idx = sources.firstIndex { sourceID($0) == curID } ?? 0
-        let next = sources[(idx + 1) % sources.count]
-        TISSelectInputSource(next)
-        log("input source -> \(sourceName(next))")
     }
 
     // MARK: - Win+D 显示桌面（隐藏全部应用，再按一次恢复）
