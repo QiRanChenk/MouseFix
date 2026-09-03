@@ -17,6 +17,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     var winShowDesktop = true
     var winThumbnails = true
     var winSpaceIME = true
+    var middleClickCopyPaste = true
 
     private let switcher = WindowSwitcherController()
     private let launcher = AppLauncherController()
@@ -47,6 +48,10 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         } else {
             showAccessibilityAlert()
             waitForTrustThenInstall()
+        }
+        // 中键功能端到端自测：需先装好 tap，跑完自动退出
+        if CommandLine.arguments.contains("--selftest-middle") {
+            runMiddleClickSelfTest()
         }
     }
 
@@ -100,6 +105,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         m.addItem(makeItem(#selector(toggleShowDesktopPref), "Win+D 显示桌面"))
         m.addItem(makeItem(#selector(toggleThumbnails), "窗口缩略图（需屏幕录制）"))
         m.addItem(makeItem(#selector(toggleSpaceIME), "Win+空格 切换输入法"))
+        m.addItem(makeItem(#selector(toggleMiddleClick), "中键复制/粘贴（无选中时粘贴）"))
         m.addItem(.separator())
         let quit = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
         quit.target = self
@@ -123,6 +129,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         setCheck(m.item(at: 4)!, on: winShowDesktop)
         setCheck(m.item(at: 5)!, on: winThumbnails)
         setCheck(m.item(at: 6)!, on: winSpaceIME)
+        setCheck(m.item(at: 7)!, on: middleClickCopyPaste)
     }
 
     private func setCheck(_ item: NSMenuItem, on: Bool) {
@@ -151,6 +158,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         switcher.thumbnailsEnabled = winThumbnails
     }
     @objc private func toggleSpaceIME() { winSpaceIME.toggle(); syncMenuTitles() }
+    @objc private func toggleMiddleClick() { middleClickCopyPaste.toggle(); syncMenuTitles() }
     @objc private func quitApp()        { NSApp.terminate(nil) }
 
     // MARK: - 授权
@@ -183,6 +191,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                               | (1 << CGEventType.flagsChanged.rawValue)
                               | (1 << CGEventType.leftMouseDown.rawValue)
                               | (1 << CGEventType.rightMouseDown.rawValue)
+                              | (1 << CGEventType.otherMouseDown.rawValue)
 
         eventTap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -201,6 +210,8 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                     return ctrl.processFlags(event)
                 case .leftMouseDown, .rightMouseDown:
                     return ctrl.processMouse(event)
+                case .otherMouseDown:
+                    return ctrl.processMiddleClick(event)
                 case .tapDisabledByTimeout, .tapDisabledByUserInput:
                     if let tap = ctrl.eventTap {
                         CGEvent.tapEnable(tap: tap, enable: true)
@@ -419,6 +430,144 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         }
         return Unmanaged.passRetained(event)
     }
+
+    // MARK: - 中键：有选中 → 复制，无选中 → 粘贴
+    // 原理：中键按下先合成 Cmd+C「探测」，~250ms 内剪贴板 changeCount 变了 = 原本有选中（复制完成）；
+    // 没变 = 无选中，再合成 Cmd+V 粘贴。比 AX 选中检测通用（很多应用不暴露 kAXSelectedText）。
+    // 作用对象与系统快捷键一致：当前聚焦（frontmost）应用。
+    private var middleClickToken = 0
+    private var middleProbeTimer: DispatchSourceTimer?
+
+    private func processMiddleClick(_ event: CGEvent) -> Unmanaged<CGEvent>? {
+        cmdAlonePending = false
+        // 功能关闭时走普通鼠标处理（面板外点击取消等），中键原样放行
+        guard middleClickCopyPaste else { return processMouse(event) }
+        // 只接管中键（button 2），鼠标侧键不受影响
+        guard event.getIntegerValueField(.mouseEventButtonNumber) == 2 else {
+            return Unmanaged.passRetained(event)
+        }
+        // 中键点在切换器/启动器期间一律先收起面板（面板里没有可复制内容，避免误粘贴到后方应用）
+        if switcher.isVisible { switcher.cancel() }
+        if launcher.isVisible { launcher.hide() }
+        startCopyPasteProbe()
+        return nil   // 吞掉中键，避免应用同时响应（浏览器中键开新链接、按住中键平移画布等）
+    }
+
+    /// 复制/粘贴探测。连续快速中键时以最后一次为准（token 作废上一轮未完成的探测）。
+    private func startCopyPasteProbe() {
+        middleClickToken += 1
+        let token = middleClickToken
+        middleProbeTimer?.cancel()
+        middleProbeTimer = nil
+
+        let original = NSPasteboard.general.changeCount
+        postCmdKey(Key.c)
+        var tries = 0
+        let timer = DispatchSource.makeTimerSource(queue: .main)
+        timer.schedule(deadline: .now() + .milliseconds(25), repeating: .milliseconds(25))
+        timer.setEventHandler { [weak self] in
+            guard let self, self.middleClickToken == token else { timer.cancel(); return }
+            if NSPasteboard.general.changeCount != original {
+                timer.cancel()
+                self.middleProbeTimer = nil
+                self.log("middle click -> copy")
+            } else if tries >= 9 {   // ≈250ms 剪贴板无变化 = 无选中 → 粘贴
+                timer.cancel()
+                self.middleProbeTimer = nil
+                self.postCmdKey(Key.v)
+                self.log("middle click -> paste")
+            }
+            tries += 1
+        }
+        timer.resume()
+        middleProbeTimer = timer
+    }
+
+    /// 合成 Cmd+键（打 synthetic 标记；事件会再次经过自己的 tap，processKey 只放行 Cmd 组合不会拦截）
+    private func postCmdKey(_ keyCode: Int64) {
+        let key = CGKeyCode(keyCode)
+        for down in [true, false] {
+            guard let e = CGEvent(keyboardEventSource: nil, virtualKey: key, keyDown: down) else { continue }
+            e.flags = .maskCommand
+            e.setIntegerValueField(.eventSourceUserData, value: kSyntheticMarker)
+            e.post(tap: .cgSessionEventTap)
+        }
+    }
+
+    // MARK: - 中键自测（--selftest-middle）：自建窗口 + 合成事件端到端验证，结果写日志后退出
+    // 阶段 1：文本框全选 + 合成中键 → 剪贴板应变为文本（复制路径）
+    // 阶段 2：光标移到末尾（无选中）+ 剪贴板放 token + 合成中键 → 文本应追加 token（粘贴路径）
+    private func runMiddleClickSelfTest() {
+        NSApp.setActivationPolicy(.regular)
+        // 程序化创建的裸应用没有主菜单，Cmd+C/V 找不到菜单等价键会是 no-op；
+        // 真实应用都有 Edit 菜单（功能正是模拟按这些快捷键），这里补一个最小 Edit 菜单
+        let mainMenu = NSMenu()
+        let editItem = NSMenuItem()
+        mainMenu.addItem(editItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        NSApp.mainMenu = mainMenu
+
+        let win = NSWindow(contentRect: NSRect(x: 300, y: 500, width: 420, height: 100),
+                           styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        win.isReleasedWhenClosed = false
+        win.title = "MouseFix SelfTest"
+        let field = NSTextField(frame: NSRect(x: 20, y: 40, width: 380, height: 24))
+        field.stringValue = "hello middle click"
+        win.contentView?.addSubview(field)
+        win.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        win.makeFirstResponder(field)
+        log("selftest: window ready")
+
+        let pb = NSPasteboard.general
+        let text = "hello middle click"
+        func ensureActive(_ tag: String) {
+            NSApp.activate(ignoringOtherApps: true)
+            let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
+            log("selftest \(tag): active=\(NSApp.isActive) keyWin=\(win.isKeyWindow) front=\(front)")
+        }
+        func postMiddle() {
+            // 事件会被自己的 tap 吞掉，坐标仅是元数据，不参与命中
+            if let e = CGEvent(mouseEventSource: nil, mouseType: .otherMouseDown,
+                               mouseCursorPosition: win.frame.origin, mouseButton: .center) {
+                e.post(tap: .cgSessionEventTap)
+            }
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+            // 阶段 1：有选中 → 复制
+            ensureActive("phase1")
+            field.currentEditor()?.selectAll(nil)
+            pb.clearContents()
+            let before = pb.changeCount
+            postMiddle()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                let copyOK = pb.changeCount != before && pb.string(forType: .string) == text
+                self.log("selftest copy: \(copyOK ? "OK" : "FAIL")")
+                // 阶段 2：无选中 → 粘贴
+                ensureActive("phase2")
+                pb.clearContents()
+                pb.setString("PASTE-TOKEN", forType: .string)
+                if let ed = field.currentEditor() {
+                    ed.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+                }
+                postMiddle()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    let pasteOK = field.stringValue.contains("PASTE-TOKEN")
+                    self.log("selftest paste: \(pasteOK ? "OK" : "FAIL"), field=\(field.stringValue)")
+                    let ok = copyOK && pasteOK
+                    self.log("SELFTEST-MIDDLE \(ok ? "PASS" : "FAIL")")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
+                }
+            }
+        }
+    }
+
 
     // MARK: - 滚轮：仅反转鼠标，触摸板不动；动量平滑滚动
     private func processScroll(_ event: CGEvent) -> Unmanaged<CGEvent>? {
