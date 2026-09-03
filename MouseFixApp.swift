@@ -118,11 +118,12 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     }
 
     private var logFileHandle: FileHandle?
+    private let logQueue = DispatchQueue(label: "mousefix.log")
 
     private func log(_ s: String) {
         let line = "[\(Date())] \(s)\n"
-        if let data = line.data(using: .utf8) {
-            logFileHandle?.write(data)
+        logQueue.async { [weak self] in
+            if let data = line.data(using: .utf8) { self?.logFileHandle?.write(data) }
         }
         NSLog("[MouseFix] %@", s)
     }
@@ -256,6 +257,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                     if let tap = ctrl.eventTap {
                         CGEvent.tapEnable(tap: tap, enable: true)
                     }
+                    ctrl.log("event tap re-enabled (type=\(type.rawValue))")
                     return Unmanaged.passRetained(event)
                 default:
                     return Unmanaged.passRetained(event)
@@ -436,9 +438,15 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     // 作用对象与系统快捷键一致：当前聚焦（frontmost）应用。
     private var middleClickToken = 0
     private var middleProbeTimer: DispatchSourceTimer?
+    /// 已推过 AX 开关的应用（每个 pid 只推一次，避免反复打扰浏览器）
+    private var axNudgedPids = Set<pid_t>()
 
     private func processMiddleClick(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         cmdAlonePending = false
+        // 自己补发的放行事件（带标记）直接放行给应用
+        if event.getIntegerValueField(.eventSourceUserData) == kSyntheticMarker {
+            return Unmanaged.passRetained(event)
+        }
         // 功能关闭时走普通鼠标处理（面板外点击取消等），中键原样放行
         guard middleClickCopyPaste else { return processMouse(event) }
         // 只接管中键（button 2），鼠标侧键不受影响
@@ -448,33 +456,68 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         // 中键点在切换器/启动器期间一律先收起面板（面板里没有可复制内容，避免误粘贴到后方应用）
         if switcher.isVisible { switcher.cancel() }
         if launcher.isVisible { launcher.hide() }
-        // 标签栏等浏览器框架控件上的中键保留原生行为（关闭标签页等），放行给应用
-        if clickHitsTabStrip(event) {
-            log("middle click -> passthrough (tab strip)")
-            return Unmanaged.passRetained(event)
+
+        // tap 回调内绝不能做同步 AX 查询（阻塞会让整个 tap 被系统禁用）：
+        // 先吞下事件，后台线程做 AX 命中测试；判为标签栏 → 补发带标记合成中键放行（原生关标签）；
+        // 否则 → 回主线程走复制/粘贴探测
+        middleClickToken += 1
+        let token = middleClickToken
+        let loc = event.location
+        let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self, self.middleClickToken == token else { return }
+            let onTabStrip = self.clickHitsTabStrip(at: loc, frontPid: frontPid)
+            DispatchQueue.main.async {
+                guard self.middleClickToken == token else { return }
+                if onTabStrip {
+                    self.log("middle click -> passthrough (tab strip)")
+                    self.repostMiddleClick(at: loc)
+                } else {
+                    self.startCopyPasteProbe()
+                }
+            }
         }
-        startCopyPasteProbe()
         return nil   // 吞掉中键，避免应用同时响应（浏览器中键开新链接、按住中键平移画布等）
     }
 
-    /// 光标处 AX 命中测试：是否落在标签栏类控件（AXTabGroup / AXPageTabList / AXPageTab 及其子层级）上。
-    /// 命中失败一律返回 false（走复制/粘贴流程）。
-    private func clickHitsTabStrip(_ event: CGEvent) -> Bool {
+    /// 补发一对带标记的合成中键 down+up：tap 收到带标记的中键会直接放行，浏览器即收到完整点击
+    private func repostMiddleClick(at loc: CGPoint) {
+        for mouseType in [CGEventType.otherMouseDown, .otherMouseUp] {
+            guard let e = CGEvent(mouseEventSource: nil, mouseType: mouseType,
+                                  mouseCursorPosition: loc, mouseButton: .center) else { continue }
+            e.setIntegerValueField(.eventSourceUserData, value: kSyntheticMarker)
+            e.post(tap: .cgSessionEventTap)
+        }
+    }
+
+    /// 光标处 AX 命中测试：是否落在浏览器框架控件（标签栏/工具栏）上。
+    /// 首次未命中时，给聚焦应用推 AX 开关（Chromium 默认不开辅助功能）并等树构建后重试一次。
+    private func clickHitsTabStrip(at loc: CGPoint, frontPid: pid_t?) -> Bool {
+        let first = tabStripHitTest(at: loc)
+        if first == true { return true }
+        guard let pid = frontPid, !axNudgedPids.contains(pid) else { return first ?? false }
+        axNudgedPids.insert(pid)
+        nudgeAXForApp(pid: pid)
+        usleep(200_000)   // 等浏览器构建 AX 树（后台线程，可阻塞）
+        return tabStripHitTest(at: loc) ?? false
+    }
+
+    /// true = 命中标签栏/工具栏；false = 查到了但不是；nil = AX 查询失败
+    private func tabStripHitTest(at loc: CGPoint) -> Bool? {
         let sysWide = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(sysWide, 0.1)
-        let loc = event.location
+        AXUIElementSetMessagingTimeout(sysWide, 0.3)
         var hit: AXUIElement?
         guard AXUIElementCopyElementAtPosition(sysWide, Float(loc.x), Float(loc.y), &hit) == .success,
-              let start = hit else { return false }
-        let tabRoles: Set<String> = ["AXTabGroup", "AXPageTabList", "AXPageTab"]
+              let start = hit else { return nil }
+        let chromeRoles: Set<String> = ["AXTabGroup", "AXPageTabList", "AXPageTab", "AXToolbar"]
         var cur: AXUIElement? = start
         var depth = 0
-        while let el = cur, depth < 6 {
+        while let el = cur, depth < 8 {
             var roleObj: AnyObject?
-            if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleObj) == .success,
-               let role = roleObj as? String, tabRoles.contains(role) {
-                return true
-            }
+            let role = (AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleObj) == .success)
+                ? (roleObj as? String) ?? "" : ""
+            if depth == 0 { log("middle click: hit role=\(role)") }
+            if chromeRoles.contains(role) { return true }
             var parentObj: AnyObject?
             guard AXUIElementCopyAttributeValue(el, kAXParentAttribute as CFString, &parentObj) == .success,
                   let p = parentObj else { break }
@@ -482,6 +525,14 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
             depth += 1
         }
         return false
+    }
+
+    /// Chromium 系浏览器检测到这些 AX 属性才会构建完整辅助功能树（含标签栏/网页内容）
+    private func nudgeAXForApp(pid: pid_t) {
+        let appEl = AXUIElementCreateApplication(pid)
+        AXUIElementSetAttributeValue(appEl, "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        AXUIElementSetAttributeValue(appEl, "AXManualAccessibility" as CFString, kCFBooleanTrue)
+        log("middle click: nudged AX for pid \(pid)")
     }
 
     /// 复制/粘贴探测。连续快速中键时以最后一次为准（token 作废上一轮未完成的探测）。
