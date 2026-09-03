@@ -10,14 +10,57 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var eventTap: CFMachPort?
 
-    var reverseScroll = true
-    var winKeyRemap = true
-    var winSwitcher = true
-    var winKeyLauncher = true
-    var winShowDesktop = true
-    var winThumbnails = true
-    var winSpaceIME = true
-    var middleClickCopyPaste = true
+    // MARK: - 功能开关（UserDefaults 持久化：勾选即保存，下次启动恢复；缺省全开）
+    private enum PrefKey {
+        static let reverseScroll        = "reverseScroll"
+        static let winKeyRemap          = "winKeyRemap"
+        static let winSwitcher          = "winSwitcher"
+        static let winKeyLauncher       = "winKeyLauncher"
+        static let winShowDesktop       = "winShowDesktop"
+        static let winThumbnails        = "winThumbnails"
+        static let winSpaceIME          = "winSpaceIME"
+        static let middleClickCopyPaste = "middleClickCopyPaste"
+    }
+
+    private static func pref(_ key: String) -> Bool {
+        UserDefaults.standard.object(forKey: key) as? Bool ?? true
+    }
+    private static func setPref(_ key: String, _ value: Bool) {
+        UserDefaults.standard.set(value, forKey: key)
+    }
+
+    var reverseScroll: Bool {
+        get { Self.pref(PrefKey.reverseScroll) }
+        set { Self.setPref(PrefKey.reverseScroll, newValue) }
+    }
+    var winKeyRemap: Bool {
+        get { Self.pref(PrefKey.winKeyRemap) }
+        set { Self.setPref(PrefKey.winKeyRemap, newValue) }
+    }
+    var winSwitcher: Bool {
+        get { Self.pref(PrefKey.winSwitcher) }
+        set { Self.setPref(PrefKey.winSwitcher, newValue) }
+    }
+    var winKeyLauncher: Bool {
+        get { Self.pref(PrefKey.winKeyLauncher) }
+        set { Self.setPref(PrefKey.winKeyLauncher, newValue) }
+    }
+    var winShowDesktop: Bool {
+        get { Self.pref(PrefKey.winShowDesktop) }
+        set { Self.setPref(PrefKey.winShowDesktop, newValue) }
+    }
+    var winThumbnails: Bool {
+        get { Self.pref(PrefKey.winThumbnails) }
+        set { Self.setPref(PrefKey.winThumbnails, newValue) }
+    }
+    var winSpaceIME: Bool {
+        get { Self.pref(PrefKey.winSpaceIME) }
+        set { Self.setPref(PrefKey.winSpaceIME, newValue) }
+    }
+    var middleClickCopyPaste: Bool {
+        get { Self.pref(PrefKey.middleClickCopyPaste) }
+        set { Self.setPref(PrefKey.middleClickCopyPaste, newValue) }
+    }
 
     private let switcher = WindowSwitcherController()
     private let launcher = AppLauncherController()
@@ -30,6 +73,11 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         setupMenu()
         switcher.log = { [weak self] s in self?.log(s) }
         launcher.log = { [weak self] s in self?.log(s) }
+        // 缩略图开关持久化值同步给切换器（此前只在菜单点击时同步，启动时默认 true 会漂移）
+        switcher.thumbnailsEnabled = winThumbnails
+        log("config: reverseScroll=\(reverseScroll) winKeyRemap=\(winKeyRemap) winSwitcher=\(winSwitcher) "
+          + "winKeyLauncher=\(winKeyLauncher) winShowDesktop=\(winShowDesktop) winThumbnails=\(winThumbnails) "
+          + "winSpaceIME=\(winSpaceIME) middleClickCopyPaste=\(middleClickCopyPaste)")
         // 调试预览：--preview-switcher 直接展示切换器面板（不装 tap，无需授权，便于截图验证 UI）
         if CommandLine.arguments.contains("--preview-switcher") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in

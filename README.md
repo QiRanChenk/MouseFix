@@ -55,7 +55,7 @@ A tiny macOS menu bar utility that makes Windows switchers feel at home. Single-
 - 其他修饰键原样保留（`Ctrl+Shift+V` 同样生效）
 - **终端类 app 自动跳过**（Terminal、iTerm2、Warp、kitty、WezTerm、Alacritty、Hyper、Ghostty）——终端里 `Ctrl+C` 是 SIGINT、`Ctrl+Z` 是 SIGTSTP、`Ctrl+S` 是流控冻结，不能动
 
-所有功能都可在菜单栏独立开关。
+所有功能都可在菜单栏独立开关，勾选状态自动保存（UserDefaults），重启后恢复上次的配置。
 
 ## 系统要求
 
