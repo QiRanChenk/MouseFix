@@ -440,6 +440,8 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
     private var middleProbeTimer: DispatchSourceTimer?
     /// 已推过 AX 开关的应用（每个 pid 只推一次，避免反复打扰浏览器）
     private var axNudgedPids = Set<pid_t>()
+    /// 最近一次中键的屏幕位置（探测无果时补发放行事件用）
+    private var lastMiddleClickLoc = CGPoint.zero
 
     private func processMiddleClick(_ event: CGEvent) -> Unmanaged<CGEvent>? {
         cmdAlonePending = false
@@ -457,30 +459,37 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         if switcher.isVisible { switcher.cancel() }
         if launcher.isVisible { launcher.hide() }
 
-        // tap 回调内绝不能做同步 AX 查询（阻塞会让整个 tap 被系统禁用）：
-        // 先吞下事件，后台线程做 AX 命中测试；判为标签栏 → 补发带标记合成中键放行（原生关标签）；
-        // 否则 → 回主线程走复制/粘贴探测
-        middleClickToken += 1
-        let token = middleClickToken
+        // tap 回调内绝不能做同步 AX 查询（阻塞会让整个 tap 被系统禁用）→ 移到后台线程：
+        //   命中标签栏/工具栏 → 立即补发带标记合成中键放行（原生关标签等）
+        //   命中编辑框        → 探测：无选中则粘贴
+        //   其它（网页空白、识别不出的标签页等）→ 探测：有选中复制；无选中放行给应用
         let loc = event.location
         let frontPid = NSWorkspace.shared.frontmostApplication?.processIdentifier
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self, self.middleClickToken == token else { return }
-            let onTabStrip = self.clickHitsTabStrip(at: loc, frontPid: frontPid)
+            guard let self else { return }
+            let hit = self.performMiddleClickHitTest(at: loc, frontPid: frontPid)
             DispatchQueue.main.async {
-                guard self.middleClickToken == token else { return }
-                if onTabStrip {
-                    self.log("middle click -> passthrough (tab strip)")
+                if Self.chromeRoles.contains(hit.role) {
+                    self.log("middle click -> passthrough (chrome: \(hit.role))")
                     self.repostMiddleClick(at: loc)
                 } else {
-                    self.startCopyPasteProbe()
+                    self.lastMiddleClickLoc = loc
+                    self.startCopyPasteProbe(allowPaste: hit.editable)
                 }
             }
         }
-        return nil   // 吞掉中键，避免应用同时响应（浏览器中键开新链接、按住中键平移画布等）
+        return nil   // 吞掉中键，避免应用同时响应
     }
 
-    /// 补发一对带标记的合成中键 down+up：tap 收到带标记的中键会直接放行，浏览器即收到完整点击
+    private static let chromeRoles: Set<String> = ["AXTabGroup", "AXPageTabList", "AXPageTab", "AXToolbar"]
+    private static let editableRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox"]
+
+    private struct MiddleHit {
+        let element: AXUIElement
+        let role: String
+    }
+
+    /// 补发一对带标记的合成中键 down+up：tap 收到带标记的中键会直接放行，应用即收到完整点击
     private func repostMiddleClick(at loc: CGPoint) {
         for mouseType in [CGEventType.otherMouseDown, .otherMouseUp] {
             guard let e = CGEvent(mouseEventSource: nil, mouseType: mouseType,
@@ -490,41 +499,38 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 光标处 AX 命中测试：是否落在浏览器框架控件（标签栏/工具栏）上。
-    /// 首次未命中时，给聚焦应用推 AX 开关（Chromium 默认不开辅助功能）并等树构建后重试一次。
-    private func clickHitsTabStrip(at loc: CGPoint, frontPid: pid_t?) -> Bool {
-        let first = tabStripHitTest(at: loc)
-        if first == true { return true }
-        guard let pid = frontPid, !axNudgedPids.contains(pid) else { return first ?? false }
-        axNudgedPids.insert(pid)
-        nudgeAXForApp(pid: pid)
-        usleep(200_000)   // 等浏览器构建 AX 树（后台线程，可阻塞）
-        return tabStripHitTest(at: loc) ?? false
+    /// 命中测试 + 每应用一次的 AX 激活重试
+    private func performMiddleClickHitTest(at loc: CGPoint, frontPid: pid_t?) -> (role: String, editable: Bool) {
+        var hit = axHitTest(at: loc)
+        if let pid = frontPid, !axNudgedPids.contains(pid) {
+            // Chromium 系默认不构建辅助功能树，推一次开关后重查（每 pid 仅一次）
+            axNudgedPids.insert(pid)
+            nudgeAXForApp(pid: pid)
+            usleep(200_000)
+            hit = axHitTest(at: loc)
+        }
+        guard let h = hit else { return ("", false) }
+        log("middle click: hit role=\(h.role)")
+        let editable = Self.editableRoles.contains(h.role)
+            || (h.role.isEmpty && supportsSelectedTextRange(h.element))
+        return (h.role, editable)
     }
 
-    /// true = 命中标签栏/工具栏；false = 查到了但不是；nil = AX 查询失败
-    private func tabStripHitTest(at loc: CGPoint) -> Bool? {
+    private func axHitTest(at loc: CGPoint) -> MiddleHit? {
         let sysWide = AXUIElementCreateSystemWide()
         AXUIElementSetMessagingTimeout(sysWide, 0.3)
         var hit: AXUIElement?
         guard AXUIElementCopyElementAtPosition(sysWide, Float(loc.x), Float(loc.y), &hit) == .success,
-              let start = hit else { return nil }
-        let chromeRoles: Set<String> = ["AXTabGroup", "AXPageTabList", "AXPageTab", "AXToolbar"]
-        var cur: AXUIElement? = start
-        var depth = 0
-        while let el = cur, depth < 8 {
-            var roleObj: AnyObject?
-            let role = (AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleObj) == .success)
-                ? (roleObj as? String) ?? "" : ""
-            if depth == 0 { log("middle click: hit role=\(role)") }
-            if chromeRoles.contains(role) { return true }
-            var parentObj: AnyObject?
-            guard AXUIElementCopyAttributeValue(el, kAXParentAttribute as CFString, &parentObj) == .success,
-                  let p = parentObj else { break }
-            cur = (p as! AXUIElement)
-            depth += 1
-        }
-        return false
+              let el = hit else { return nil }
+        var roleObj: AnyObject?
+        let role = (AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleObj) == .success)
+            ? (roleObj as? String) ?? "" : ""
+        return MiddleHit(element: el, role: role)
+    }
+
+    private func supportsSelectedTextRange(_ el: AXUIElement) -> Bool {
+        var v: AnyObject?
+        return AXUIElementCopyAttributeValue(el, kAXSelectedTextRangeAttribute as CFString, &v) == .success && v != nil
     }
 
     /// Chromium 系浏览器检测到这些 AX 属性才会构建完整辅助功能树（含标签栏/网页内容）
@@ -535,8 +541,10 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         log("middle click: nudged AX for pid \(pid)")
     }
 
-    /// 复制/粘贴探测。连续快速中键时以最后一次为准（token 作废上一轮未完成的探测）。
-    private func startCopyPasteProbe() {
+    /// 复制/粘贴探测。allowPaste=true 表示点击命中了编辑框：无选中时粘贴。
+    /// allowPaste=false（普通区域）：无选中时把事件放行给应用（关标签、开链接等原生行为）。
+    /// 连续快速中键以最后一次为准（token 作废上一轮未完成的探测）。
+    private func startCopyPasteProbe(allowPaste: Bool) {
         middleClickToken += 1
         let token = middleClickToken
         middleProbeTimer?.cancel()
@@ -553,50 +561,21 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                 timer.cancel()
                 self.middleProbeTimer = nil
                 self.log("middle click -> copy")
-            } else if tries >= 9 {   // ≈250ms 剪贴板无变化 = 无选中
+            } else if tries >= 7 {   // ≈200ms 剪贴板无变化 = 无选中
                 timer.cancel()
                 self.middleProbeTimer = nil
-                switch self.focusedEditableState() {
-                case false:   // AX 明确表明聚焦的不是可编辑文本 → 不粘贴
-                    self.log("middle click -> paste skipped (no focused text input)")
-                default:      // 输入框激活，或 AX 无法判断（保底粘贴，兼容终端等 AX 薄弱应用）
+                if allowPaste {
                     self.postCmdKey(Key.v)
                     self.log("middle click -> paste")
+                } else {
+                    self.log("middle click -> passthrough (no selection, not editable)")
+                    self.repostMiddleClick(at: self.lastMiddleClickLoc)
                 }
             }
             tries += 1
         }
         timer.resume()
         middleProbeTimer = timer
-    }
-
-    /// AX 判断当前聚焦元素是否可编辑文本（输入框激活）。
-    /// true = 文本框/文本域等；false = 有角色但明确不是可编辑文本；nil = 无法判断（无聚焦元素/AX 不可用）。
-    private func focusedEditableState() -> Bool? {
-        let systemWide = AXUIElementCreateSystemWide()
-        AXUIElementSetMessagingTimeout(systemWide, 0.1)   // 主线程调用，限时防卡
-        var value: AnyObject?
-        guard AXUIElementCopyAttributeValue(systemWide, kAXFocusedUIElementAttribute as CFString, &value) == .success,
-              let element = value else { return nil }
-        let axEl = element as! AXUIElement
-        AXUIElementSetMessagingTimeout(axEl, 0.1)
-
-        // 常见可编辑文本角色
-        var roleObj: AnyObject?
-        let role = (AXUIElementCopyAttributeValue(axEl, kAXRoleAttribute as CFString, &roleObj) == .success)
-            ? (roleObj as? String) ?? "" : ""
-        if ["AXTextField", "AXTextArea", "AXComboBox"].contains(role) { return true }
-
-        // 无角色信息的自绘编辑器：支持读写选区即视为可编辑。
-        // 只在 role 为空时启用——网页区域(AXWebArea)等也支持选区查询，不能据此当输入框（曾导致误粘贴）
-        if role.isEmpty {
-            var rangeObj: AnyObject?
-            if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString, &rangeObj) == .success,
-               rangeObj != nil { return true }
-        }
-
-        // 有角色但不是文本角色 → 明确不是输入框；连元素都没有 → 无法判断（nil，保底粘贴）
-        return role.isEmpty ? nil : false
     }
 
     /// 合成 Cmd+键（打 synthetic 标记；事件会再次经过自己的 tap，processKey 只放行 Cmd 组合不会拦截）
@@ -635,9 +614,11 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         let field = NSTextField(frame: NSRect(x: 20, y: 40, width: 380, height: 24))
         field.stringValue = "hello middle click"
         win.contentView?.addSubview(field)
-        // 可聚焦的非文本视图（模拟无输入框激活的场景）
+        // 可聚焦的非文本视图（模拟无输入框场景）：断言「探测无果后事件放行」用
         final class FocusAnchor: NSView {
+            static var gotRepost = false
             override var acceptsFirstResponder: Bool { true }
+            override func otherMouseDown(with e: NSEvent) { FocusAnchor.gotRepost = true }
         }
         let anchor = FocusAnchor(frame: NSRect(x: 20, y: 8, width: 120, height: 14))
         win.contentView?.addSubview(anchor)
@@ -698,21 +679,23 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     let pasteOK = field.stringValue.contains("PASTE-TOKEN")
                     self.log("selftest paste: \(pasteOK ? "OK" : "FAIL"), field=\(field.stringValue)")
-                    // 阶段 3（观察）：非输入框聚焦 → 粘贴应被跳过（AX 可识别时）
+                    // 阶段 3：点击非编辑区（无选中）→ 不粘贴，且事件应放行给应用（FocusAnchor 收到补发点击）
                     win.makeFirstResponder(anchor)
+                    FocusAnchor.gotRepost = false
                     pb.clearContents()
                     pb.setString("NOPE-TOKEN", forType: .string)
-                    postMiddleAtField()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                        let skipped = !field.stringValue.contains("NOPE-TOKEN")
-                        self.log("selftest skip-path: skipped=\(skipped), editableState=\(String(describing: self.focusedEditableState()))")
-                        // 阶段 4（断言）：标签栏（AXTabGroup）上中键 → 事件放行给应用（原生关标签），不进入复制/粘贴
+                    postMiddle(at: NSPoint(x: win.frame.origin.x + 80, y: win.frame.origin.y + 15))
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+                        let noPaste = !field.stringValue.contains("NOPE-TOKEN")
+                        let reposted = FocusAnchor.gotRepost
+                        self.log("selftest skip+passthrough: noPaste=\(noPaste) reposted=\(reposted)")
+                        // 阶段 4（断言）：标签栏（AXTabGroup）上中键 → 事件立即放行（原生关标签）
                         TabProbeView.gotMiddle = false
                         postMiddle(at: NSPoint(x: win.frame.origin.x + 130, y: win.frame.origin.y + 95))
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                             let tabOK = TabProbeView.gotMiddle
                             self.log("selftest tab-passthrough: \(tabOK ? "OK" : "FAIL"), gotMiddle=\(TabProbeView.gotMiddle)")
-                            let ok = copyOK && pasteOK && tabOK
+                            let ok = copyOK && pasteOK && noPaste && reposted && tabOK
                             self.log("SELFTEST-MIDDLE \(ok ? "PASS" : "FAIL")")
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
                         }
