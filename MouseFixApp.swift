@@ -448,8 +448,40 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         // 中键点在切换器/启动器期间一律先收起面板（面板里没有可复制内容，避免误粘贴到后方应用）
         if switcher.isVisible { switcher.cancel() }
         if launcher.isVisible { launcher.hide() }
+        // 标签栏等浏览器框架控件上的中键保留原生行为（关闭标签页等），放行给应用
+        if clickHitsTabStrip(event) {
+            log("middle click -> passthrough (tab strip)")
+            return Unmanaged.passRetained(event)
+        }
         startCopyPasteProbe()
         return nil   // 吞掉中键，避免应用同时响应（浏览器中键开新链接、按住中键平移画布等）
+    }
+
+    /// 光标处 AX 命中测试：是否落在标签栏类控件（AXTabGroup / AXPageTabList / AXPageTab 及其子层级）上。
+    /// 命中失败一律返回 false（走复制/粘贴流程）。
+    private func clickHitsTabStrip(_ event: CGEvent) -> Bool {
+        let sysWide = AXUIElementCreateSystemWide()
+        AXUIElementSetMessagingTimeout(sysWide, 0.1)
+        let loc = event.location
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(sysWide, Float(loc.x), Float(loc.y), &hit) == .success,
+              let start = hit else { return false }
+        let tabRoles: Set<String> = ["AXTabGroup", "AXPageTabList", "AXPageTab"]
+        var cur: AXUIElement? = start
+        var depth = 0
+        while let el = cur, depth < 6 {
+            var roleObj: AnyObject?
+            if AXUIElementCopyAttributeValue(el, kAXRoleAttribute as CFString, &roleObj) == .success,
+               let role = roleObj as? String, tabRoles.contains(role) {
+                return true
+            }
+            var parentObj: AnyObject?
+            guard AXUIElementCopyAttributeValue(el, kAXParentAttribute as CFString, &parentObj) == .success,
+                  let p = parentObj else { break }
+            cur = (p as! AXUIElement)
+            depth += 1
+        }
+        return false
     }
 
     /// 复制/粘贴探测。连续快速中键时以最后一次为准（token 作废上一轮未完成的探测）。
@@ -504,12 +536,15 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
             ? (roleObj as? String) ?? "" : ""
         if ["AXTextField", "AXTextArea", "AXComboBox"].contains(role) { return true }
 
-        // 自绘编辑器/终端等：支持读写选区即视为可编辑
-        var rangeObj: AnyObject?
-        if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString, &rangeObj) == .success,
-           rangeObj != nil { return true }
+        // 无角色信息的自绘编辑器：支持读写选区即视为可编辑。
+        // 只在 role 为空时启用——网页区域(AXWebArea)等也支持选区查询，不能据此当输入框（曾导致误粘贴）
+        if role.isEmpty {
+            var rangeObj: AnyObject?
+            if AXUIElementCopyAttributeValue(axEl, kAXSelectedTextRangeAttribute as CFString, &rangeObj) == .success,
+               rangeObj != nil { return true }
+        }
 
-        // 有角色但既不是文本角色也不支持选区 → 明确不是输入框
+        // 有角色但不是文本角色 → 明确不是输入框；连元素都没有 → 无法判断（nil，保底粘贴）
         return role.isEmpty ? nil : false
     }
 
@@ -542,7 +577,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         editItem.submenu = editMenu
         NSApp.mainMenu = mainMenu
 
-        let win = NSWindow(contentRect: NSRect(x: 300, y: 500, width: 420, height: 100),
+        let win = NSWindow(contentRect: NSRect(x: 300, y: 400, width: 420, height: 170),
                            styleMask: [.titled, .closable], backing: .buffered, defer: false)
         win.isReleasedWhenClosed = false
         win.title = "MouseFix SelfTest"
@@ -555,6 +590,16 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
         }
         let anchor = FocusAnchor(frame: NSRect(x: 20, y: 8, width: 120, height: 14))
         win.contentView?.addSubview(anchor)
+        // 标签栏（NSTabView 在 AX 树中是 AXTabGroup）：模拟浏览器标签栏
+        final class TabProbeView: NSView {
+            static var gotMiddle = false
+            override func otherMouseDown(with e: NSEvent) { TabProbeView.gotMiddle = true }
+        }
+        let tabView = NSTabView(frame: NSRect(x: 20, y: 75, width: 220, height: 80))
+        let tabItem = NSTabViewItem(identifier: "tab1")
+        tabItem.view = TabProbeView(frame: tabView.bounds)
+        tabView.addTabViewItem(tabItem)
+        win.contentView?.addSubview(tabView)
         win.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         win.makeFirstResponder(field)
@@ -562,17 +607,23 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
 
         let pb = NSPasteboard.general
         let text = "hello middle click"
+        // AppKit 全局坐标（左下原点）→ CG 全局坐标（左上原点）：cgY = 主屏高 - appkitY
+        let primaryH = NSScreen.screens.first?.frame.height ?? 900
+        func cgPoint(fromAppKit p: NSPoint) -> NSPoint { NSPoint(x: p.x, y: primaryH - p.y) }
         func ensureActive(_ tag: String) {
             NSApp.activate(ignoringOtherApps: true)
             let front = NSWorkspace.shared.frontmostApplication?.localizedName ?? "?"
             log("selftest \(tag): active=\(NSApp.isActive) keyWin=\(win.isKeyWindow) front=\(front)")
         }
-        func postMiddle() {
-            // 事件会被自己的 tap 吞掉，坐标仅是元数据，不参与命中
+        func postMiddle(at appKitPoint: NSPoint) {
+            // 坐标现在参与 AX 命中测试（标签栏放行判定），需用真实点击位置
             if let e = CGEvent(mouseEventSource: nil, mouseType: .otherMouseDown,
-                               mouseCursorPosition: win.frame.origin, mouseButton: .center) {
+                               mouseCursorPosition: cgPoint(fromAppKit: appKitPoint), mouseButton: .center) {
                 e.post(tap: .cgSessionEventTap)
             }
+        }
+        func postMiddleAtField() {
+            postMiddle(at: NSPoint(x: win.frame.origin.x + 210, y: win.frame.origin.y + 52))
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
@@ -581,7 +632,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
             field.currentEditor()?.selectAll(nil)
             pb.clearContents()
             let before = pb.changeCount
-            postMiddle()
+            postMiddleAtField()
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
                 let copyOK = pb.changeCount != before && pb.string(forType: .string) == text
                 self.log("selftest copy: \(copyOK ? "OK" : "FAIL")")
@@ -592,7 +643,7 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                 if let ed = field.currentEditor() {
                     ed.selectedRange = NSRange(location: (text as NSString).length, length: 0)
                 }
-                postMiddle()
+                postMiddleAtField()
                 DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                     let pasteOK = field.stringValue.contains("PASTE-TOKEN")
                     self.log("selftest paste: \(pasteOK ? "OK" : "FAIL"), field=\(field.stringValue)")
@@ -600,13 +651,20 @@ final class MouseFixController: NSObject, NSApplicationDelegate {
                     win.makeFirstResponder(anchor)
                     pb.clearContents()
                     pb.setString("NOPE-TOKEN", forType: .string)
-                    postMiddle()
+                    postMiddleAtField()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                         let skipped = !field.stringValue.contains("NOPE-TOKEN")
                         self.log("selftest skip-path: skipped=\(skipped), editableState=\(String(describing: self.focusedEditableState()))")
-                        let ok = copyOK && pasteOK
-                        self.log("SELFTEST-MIDDLE \(ok ? "PASS" : "FAIL")")
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
+                        // 阶段 4（断言）：标签栏（AXTabGroup）上中键 → 事件放行给应用（原生关标签），不进入复制/粘贴
+                        TabProbeView.gotMiddle = false
+                        postMiddle(at: NSPoint(x: win.frame.origin.x + 130, y: win.frame.origin.y + 95))
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                            let tabOK = TabProbeView.gotMiddle
+                            self.log("selftest tab-passthrough: \(tabOK ? "OK" : "FAIL"), gotMiddle=\(TabProbeView.gotMiddle)")
+                            let ok = copyOK && pasteOK && tabOK
+                            self.log("SELFTEST-MIDDLE \(ok ? "PASS" : "FAIL")")
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { exit(ok ? 0 : 1) }
+                        }
                     }
                 }
             }
